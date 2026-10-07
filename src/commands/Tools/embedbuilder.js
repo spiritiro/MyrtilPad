@@ -65,6 +65,64 @@ function resolveEmbedColor(value) {
     return getColor('primary');
 }
 
+
+// Modern layout: banner and text container are sent together in one message.
+const STANDARD_EMOJI_ALIASES = {
+    wave: '\u{1F44B}', heart: '\u2764\uFE0F', blue_heart: '\u{1F499}',
+    purple_heart: '\u{1F49C}', white_heart: '\u{1F90D}', smile: '\u{1F604}',
+    smiling_face: '\u{1F60A}', grinning: '\u{1F600}', blush: '\u{1F60A}',
+    sparkles: '\u2728', star: '\u2B50', fire: '\u{1F525}',
+    white_check_mark: '\u2705', check: '\u2705', x: '\u274C',
+    tada: '\u{1F389}', rocket: '\u{1F680}', eyes: '\u{1F440}',
+    thumbsup: '\u{1F44D}', '+1': '\u{1F44D}', handshake: '\u{1F91D}',
+    art: '\u{1F3A8}', crown: '\u{1F451}', blueberries: '\u{1FAD0}',
+};
+
+function resolveMessageEmojis(text, guild) {
+    // Keep already-valid custom emoji references and code/URLs intact.
+    return String(text || '').replace(
+        /\x60\x60\x60[\s\S]*?\x60\x60\x60|\x60[^\x60\n]*\x60|https?:\/\/\S+|<a?:\w+:\d+>|:([A-Za-z0-9_+\-]+):/g,
+        (match, name) => {
+            if (!name) return match;
+            const custom = guild?.emojis?.cache?.find(emoji => emoji.name === name);
+            if (custom) return '<' + (custom.animated ? 'a' : '') + ':' + custom.name + ':' + custom.id + '>';
+            return STANDARD_EMOJI_ALIASES[name] || match;
+        },
+    );
+}
+
+function buildWideMessage(state, guild) {
+    const resolve = text => resolveMessageEmojis(text, guild);
+    const parts = [];
+    if (state.author?.name) parts.push('**' + resolve(state.author.name) + '**');
+    if (state.title) parts.push('## ' + resolve(state.title).replace(/[\r\n]+/g, ' '));
+    if (state.description) parts.push(resolve(state.description));
+    for (const field of state.fields || []) {
+        parts.push('**' + resolve(field.name) + '**\n' + resolve(field.value));
+    }
+    if (state.footer?.text) parts.push('-# ' + resolve(state.footer.text));
+    if (state.timestamp) parts.push('-# <t:' + Math.floor(Date.now() / 1000) + ':f>');
+    const content = parts.join('\n\n') || '*Add a title or description with Edit Content.*';
+    if (content.length > 4000) {
+        throw new Error('This layout allows 4000 text characters in total, including emoji references. Shorten the title, description or fields.');
+    }
+    const components = [];
+    if (state.image && isValidUrl(state.image)) {
+        components.push({ type: 12, items: [{ media: { url: state.image }, description: 'Banner' }] });
+    }
+    const text = { type: 10, content };
+    const body = state.thumbnail && isValidUrl(state.thumbnail)
+        ? { type: 9, components: [text], accessory: { type: 11, media: { url: state.thumbnail }, description: 'Thumbnail' } }
+        : text;
+    components.push({ type: 17, accent_color: resolveEmbedColor(state.color), components: [body] });
+    return { flags: 32768, components, allowedMentions: { parse: [] } };
+}
+
+async function handleWidePreview(button, state, guild) {
+    const payload = buildWideMessage(state, guild);
+    await button.reply({ ...payload, flags: payload.flags | MessageFlags.Ephemeral });
+}
+
 function buildPreviewEmbed(state) {
     const embed = new EmbedBuilder();
 
@@ -124,7 +182,7 @@ function buildDashboardEmbed(state) {
         .setTitle('Embed Builder — Control Panel')
         .setDescription(lines.join('\n'))
         .setColor(getColor('info'))
-        .setFooter({ text: 'The preview above updates live · Closes after 5 min of inactivity' });
+        .setFooter({ text: 'Classic editor preview · Use Preview Layout for the final wide layout · 15 min session' });
 }
 
 function buildMainMenu(state) {
@@ -178,6 +236,11 @@ function buildMainMenu(state) {
 
     const tertiaryRow = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
+            .setCustomId('eb_main_preview_layout')
+            .setLabel('Preview Layout')
+            .setStyle(ButtonStyle.Primary)
+            .setEmoji('👁️'),
+        new ButtonBuilder()
             .setCustomId('eb_main_reorder_fields')
             .setLabel('Reorder Fields')
             .setStyle(ButtonStyle.Secondary)
@@ -218,7 +281,7 @@ async function handleEditContent(selectInteraction, rootInteraction, state) {
                     .setValue(state.title || '')
                     .setMaxLength(256)
                     .setRequired(false)
-                    .setPlaceholder('My Embed Title'),
+                    .setPlaceholder(':wave: Welcome to Myrtil Studio!'),
             ),
             new ActionRowBuilder().addComponents(
                 new TextInputBuilder()
@@ -228,7 +291,7 @@ async function handleEditContent(selectInteraction, rootInteraction, state) {
                     .setValue(state.description ? state.description.substring(0, 4000) : '')
                     .setMaxLength(4000)
                     .setRequired(false)
-                    .setPlaceholder('Write your embed description here...'),
+                    .setPlaceholder('Text, Unicode emojis, :wave: or :your_server_emoji:'),
             ),
         );
 
@@ -487,7 +550,7 @@ async function handleSetImages(selectInteraction, rootInteraction, state) {
                 .setEmoji('🖼️'),
             new StringSelectMenuOptionBuilder()
                 .setLabel('Set Large Image')
-                .setDescription('Full-width banner image at the bottom')
+                .setDescription('Banner above the text in the published wide layout')
                 .setValue('set_image')
                 .setEmoji('📸'),
             new StringSelectMenuOptionBuilder()
@@ -988,13 +1051,13 @@ async function handlePostEmbed(selectInteraction, rootInteraction, state, guild)
             return;
         }
 
-        const finalEmbed = buildPreviewEmbed(state);
-
-        if (finalEmbed.data.description === '*(Empty — use the menu below to add content)*') {
-            finalEmbed.setDescription(null);
+        try {
+            await channel.send(buildWideMessage(state, guild));
+        } catch (error) {
+            logger.warn('Wide embed publication failed:', error.message);
+            await chanInter.followUp({ content: 'Could not publish: ' + error.message, flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
+            return;
         }
-
-        await channel.send({ embeds: [finalEmbed] });
 
         await chanInter.followUp({
             embeds: [successEmbed('Embed Sent', `Your embed has been posted to ${channel}.`)],
@@ -1006,8 +1069,7 @@ async function handlePostEmbed(selectInteraction, rootInteraction, state, guild)
 async function handleJsonExport(selectInteraction, rootInteraction, state) {
     await selectInteraction.deferUpdate();
 
-    const previewEmbed = buildPreviewEmbed(state);
-    const json = JSON.stringify(previewEmbed.toJSON(), null, 2);
+    const json = JSON.stringify(buildWideMessage(state, rootInteraction.guild), null, 2);
 
     if (json.length <= 3980) {
         await selectInteraction.followUp({
@@ -1078,6 +1140,9 @@ export default {
             collector.on('collect', async ci => {
                 try {
                     switch (ci.customId) {
+                        case 'eb_main_preview_layout':
+                            await handleWidePreview(ci, state, guild);
+                            break;
                         case 'eb_main_edit_content':
                             await handleEditContent(ci, interaction, state);
                             break;
