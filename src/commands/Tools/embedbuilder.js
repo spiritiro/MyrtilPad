@@ -144,12 +144,21 @@ function findAccessibleEmoji(name, guild) {
     return null;
 }
 
+// Explicit shortcuts supplied by the server owner.
+// These references do not grant the bot access to external emojis.
+const CUSTOM_EMOJI_ALIASES = {
+    robloxwave: '<:robloxwave:1497230923517919324>',
+};
+
 function resolveMessageEmojis(text, guild) {
     // Keep already-valid custom emoji references and code/URLs intact.
     return String(text || '').replace(
         /\x60\x60\x60[\s\S]*?\x60\x60\x60|\x60[^\x60\n]*\x60|https?:\/\/\S+|<a?:\w+:\d+>|:([A-Za-z0-9_+ \-]+):/g,
         (match, name) => {
             if (!name) return match;
+            const aliasKey = name.trim().toLowerCase().replace(/[\s_-]/g, '');
+            const explicit = CUSTOM_EMOJI_ALIASES[aliasKey];
+            if (explicit) return explicit;
             const custom = findAccessibleEmoji(name, guild);
             if (custom) return '<' + (custom.animated ? 'a' : '') + ':' + custom.name + ':' + custom.id + '>';
             return STANDARD_EMOJI_ALIASES[name.trim().toLowerCase()] || match;
