@@ -78,15 +78,81 @@ const STANDARD_EMOJI_ALIASES = {
     art: '\u{1F3A8}', crown: '\u{1F451}', blueberries: '\u{1FAD0}',
 };
 
+
+// Cache only emojis available through this bot's own Discord connection.
+const emojiCatalogs = new WeakMap();
+async function loadEmojiCatalog(client, currentGuild, force = false) {
+    if (!client) return;
+    const previous = emojiCatalogs.get(client);
+    if (previous?.pending) return previous.pending;
+    if (!force && previous && Date.now() - previous.updatedAt < 300000) return;
+    const entry = { emojis: previous?.emojis || [], updatedAt: 0, pending: null };
+    emojiCatalogs.set(client, entry);
+    entry.pending = (async () => {
+        const results = new Map();
+        const add = collection => {
+            for (const emoji of collection?.values?.() || []) {
+                if (emoji.id && emoji.name && emoji.available !== false) results.set(emoji.id, emoji);
+            }
+        };
+        const guilds = Array.from(client.guilds?.cache?.values?.() || []);
+        if (currentGuild && !guilds.some(guild => guild.id === currentGuild.id)) guilds.push(currentGuild);
+        // Up to three concurrent requests; discord.js handles API rate limits.
+        let next = 0;
+        const worker = async () => {
+            while (next < guilds.length) {
+                const guild = guilds[next++];
+                try { add(await guild.emojis.fetch()); }
+                catch (error) {
+                    add(guild.emojis?.cache);
+                    logger.warn('Could not refresh emojis for guild ' + guild.id + ': ' + error.message);
+                }
+            }
+        };
+        await Promise.all(Array.from({ length: Math.min(3, guilds.length) }, worker));
+        const appManager = client.application?.emojis;
+        add(appManager?.cache);
+        if (appManager?.fetch) {
+            try { add(await appManager.fetch()); }
+            catch (error) { logger.warn('Could not refresh application emojis: ' + error.message); }
+        }
+        entry.emojis = Array.from(results.values());
+        entry.updatedAt = Date.now();
+    })();
+    try { await entry.pending; } finally { entry.pending = null; }
+}
+
+function findAccessibleEmoji(name, guild) {
+    const client = guild?.client;
+    const pools = [
+        Array.from(guild?.emojis?.cache?.values?.() || []),
+        Array.from(client?.application?.emojis?.cache?.values?.() || []),
+        client ? (emojiCatalogs.get(client)?.emojis || []) : [],
+        Array.from(client?.emojis?.cache?.values?.() || []),
+    ];
+    const usable = emoji => emoji.name && emoji.available !== false && emoji.usable !== false;
+    for (const pool of pools) {
+        const exact = pool.find(emoji => usable(emoji) && emoji.name === name);
+        if (exact) return exact;
+    }
+    const normalized = value => value.toLowerCase().replace(/[\s_-]/g, '');
+    for (const pool of pools) {
+        const matches = pool.filter(emoji => usable(emoji) && normalized(emoji.name) === normalized(name));
+        if (matches.length === 1) return matches[0];
+        if (matches.length > 1) return null; // Use the full emoji reference to disambiguate.
+    }
+    return null;
+}
+
 function resolveMessageEmojis(text, guild) {
     // Keep already-valid custom emoji references and code/URLs intact.
     return String(text || '').replace(
-        /\x60\x60\x60[\s\S]*?\x60\x60\x60|\x60[^\x60\n]*\x60|https?:\/\/\S+|<a?:\w+:\d+>|:([A-Za-z0-9_+\-]+):/g,
+        /\x60\x60\x60[\s\S]*?\x60\x60\x60|\x60[^\x60\n]*\x60|https?:\/\/\S+|<a?:\w+:\d+>|:([A-Za-z0-9_+ \-]+):/g,
         (match, name) => {
             if (!name) return match;
-            const custom = guild?.emojis?.cache?.find(emoji => emoji.name === name);
+            const custom = findAccessibleEmoji(name, guild);
             if (custom) return '<' + (custom.animated ? 'a' : '') + ':' + custom.name + ':' + custom.id + '>';
-            return STANDARD_EMOJI_ALIASES[name] || match;
+            return STANDARD_EMOJI_ALIASES[name.trim().toLowerCase()] || match;
         },
     );
 }
@@ -235,6 +301,10 @@ function buildMainMenu(state) {
     );
 
     const tertiaryRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId('eb_main_refresh_emojis')
+            .setLabel('Refresh Emojis')
+            .setStyle(ButtonStyle.Secondary),
         new ButtonBuilder()
             .setCustomId('eb_main_preview_layout')
             .setLabel('Preview Layout')
@@ -1115,6 +1185,7 @@ export default {
             if (!deferSuccess) return;
 
             const guild = interaction.guild;
+            await loadEmojiCatalog(interaction.client, guild);
 
             const state = {
                 title:       null,
@@ -1140,6 +1211,11 @@ export default {
             collector.on('collect', async ci => {
                 try {
                     switch (ci.customId) {
+                        case 'eb_main_refresh_emojis':
+                            await ci.deferReply({ flags: MessageFlags.Ephemeral });
+                            await loadEmojiCatalog(interaction.client, guild, true);
+                            await ci.editReply({ content: 'Emoji catalog refreshed. Use :exact_name: or the full <:name:id> reference, then Preview Layout.' });
+                            break;
                         case 'eb_main_preview_layout':
                             await handleWidePreview(ci, state, guild);
                             break;
